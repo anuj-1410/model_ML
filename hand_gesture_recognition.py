@@ -6,7 +6,7 @@ import tensorflow as tf
 import mediapipe as mp
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.models import Sequential, load_model, Model
-from tensorflow.keras.layers import Dense, Dropout, Input, BatchNormalization
+from tensorflow.keras.layers import Dense, Dropout, Input, BatchNormalization, Conv2D, MaxPooling2D, Flatten
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.utils import to_categorical
 import pickle
@@ -266,6 +266,47 @@ def collect_additional_samples(digits_to_improve=[5, 6, 7, 8, 9], samples_per_di
     
     return combined_features, combined_labels
 
+def collect_hand_gesture_images(num_samples_per_class=100):
+    # Create a folder for the dataset if needed
+    dataset_dir = 'hand_gesture_images'
+    if not os.path.exists(dataset_dir):
+        os.makedirs(dataset_dir)
+    
+    cap = cv2.VideoCapture(1)
+    all_images = []
+    all_labels = []
+    
+    # Loop over each class (digit 0-9)
+    for digit in range(10):
+        print(f"Collecting images for digit {digit}. Press 's' to start and 'q' to quit.")
+        samples_collected = 0
+        while samples_collected < num_samples_per_class:
+            ret, img = cap.read()
+            if not ret:
+                continue
+            # Optional: flip/mirror depending on desired view
+            img = cv2.flip(img, 1)
+            # Preprocess the image (get the 64x64 grayscale image)
+            img_final, _ = preprocess_image(img)
+            # Remove the batch dimension -> shape becomes (64,64,1)
+            img_final = img_final[0]
+            
+            cv2.putText(img, f"{digit}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            cv2.imshow("Collect", img)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('s'):  # start collecting
+                all_images.append(img_final)
+                all_labels.append(digit)
+                samples_collected += 1
+                print(f"Collected {samples_collected}/{num_samples_per_class} for digit {digit}")
+            elif key == ord('q'):
+                break
+        if key == ord('q'):
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+    return np.array(all_images), np.array(all_labels)
+
 # 2. CREATE MODEL FOR HAND GESTURE RECOGNITION
 def create_hand_gesture_model(input_dim, num_classes=10):
     """Create a neural network for hand gesture recognition based on landmarks"""
@@ -365,6 +406,40 @@ def create_complex_hand_gesture_model(input_dim, num_classes=10):
     )
     return model
 
+def create_cnn_hand_gesture_model(input_shape=(64, 64, 1), num_classes=10):
+    """
+    Create a CNN model for hand gesture recognition.
+    Input: Grayscale image of size 64x64 (shape=(64,64,1)).
+    Output: 10-class softmax predictions.
+    """
+    model = Sequential()
+    # First convolutional block
+    model.add(Conv2D(32, kernel_size=(3,3), activation='relu', input_shape=input_shape))
+    model.add(BatchNormalization())
+    model.add(MaxPooling2D(pool_size=(2,2)))
+    model.add(Dropout(0.25))
+    
+    # Second block
+    model.add(Conv2D(64, kernel_size=(3,3), activation='relu'))
+    model.add(BatchNormalization())
+    model.add(MaxPooling2D(pool_size=(2,2)))
+    model.add(Dropout(0.25))
+    
+    # Third block
+    model.add(Conv2D(128, kernel_size=(3,3), activation='relu'))
+    model.add(BatchNormalization())
+    model.add(MaxPooling2D(pool_size=(2,2)))
+    model.add(Dropout(0.25))
+    
+    # Fully connected layers
+    model.add(Flatten())
+    model.add(Dense(128, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(num_classes, activation='softmax'))
+    
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
 # 3. TRAIN MODEL
 def train_hand_gesture_model(X, y):
     """Train the hand gesture recognition model"""
@@ -390,7 +465,7 @@ def train_hand_gesture_model(X, y):
     # Define callbacks
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
-        ModelCheckpoint('2best_hand_gesture_model.h5', monitor='val_accuracy', save_best_only=True, verbose=1),
+        ModelCheckpoint('best_hand_gesture_model.h5', monitor='val_accuracy', save_best_only=True, verbose=1),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=1)
     ]
     
@@ -520,7 +595,7 @@ def train_with_class_weighting(X, y):
     
     history = model.fit(
         X_train, y_train_cat,
-        epochs=50,
+        epochs=500,
         batch_size=32,
         validation_data=(X_val, y_val_cat),
         callbacks=callbacks,
@@ -545,7 +620,7 @@ def real_time_hand_gesture_recognition(model=None):
     """Real-time hand gesture recognition with prediction smoothing using MediaPipe"""
     if model is None:
         if os.path.exists('best_hand_gesture_model.h5'):
-            model = load_model('best_hand_gesture_model.h5')
+            model = load_model('4best_hand_gesture_model.h5')
         else:
             print("Model not found. Please train the model first.")
             return
@@ -559,6 +634,7 @@ def real_time_hand_gesture_recognition(model=None):
     # Buffer for smoothing predictions (last 5 predictions)
     prediction_buffer = collections.deque(maxlen=5)
 
+    # Initialize MediaPipe Hands (already declared at top)
     with mp_hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.7) as hands:
         while cap.isOpened():
             ret, frame = cap.read()
@@ -566,42 +642,48 @@ def real_time_hand_gesture_recognition(model=None):
                 print("Error: Could not read frame.")
                 break
             
+            # Flip for a mirror view (optional)
             frame = cv2.flip(frame, 1)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = hands.process(rgb_frame)
 
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
+            if results.multi_hand_landmarks and results.multi_handedness:
+                # Process each detected hand along with its handedness info.
+                for hand_landmarks, hand_info in zip(results.multi_hand_landmarks, results.multi_handedness):
+                    # Extract landmarks from MediaPipe (already normalized to [0,1])
+                    landmarks = [[lmk.x, lmk.y, lmk.z] for lmk in hand_landmarks.landmark]
+                    
+                    # Mirror right-hand landmarks: MediaPipe returns landmarks in normalized coordinates.
+                    # When the hand is "Right", we mirror by replacing x with (1 - x).
+                    hand_label = hand_info.classification[0].label   # "Left" or "Right"
+                    if hand_label == "Right":
+                        landmarks = [[1 - pt[0], pt[1], pt[2]] for pt in landmarks]
+                    
+                    # Flatten and then normalize landmarks so they are translation and scale invariant.
+                    # (normalize_landmarks expects a flat array or an array reshaped to (-1,3))
+                    landmarks_flat = np.array(landmarks).flatten()
+                    landmarks_normalized = normalize_landmarks(landmarks_flat)
+                    
+                    # Predict the gesture using the model
+                    prediction = model.predict(np.array([landmarks_normalized]), verbose=0)
+                    index = np.argmax(prediction[0])
+                    confidence = prediction[0][index]
+                    
+                    # Append to prediction buffer for smoothing
+                    prediction_buffer.append(index)
+                    smoothed_pred = max(set(prediction_buffer), key=prediction_buffer.count)
+                    
+                    # Draw prediction on the frame
+                    cv2.putText(frame, f"{smoothed_pred} ({confidence:.2f})", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    # Optionally, you can also draw the landmarks using mp_drawing.
                     mp_drawing.draw_landmarks(
                         frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
                         mp_drawing_styles.get_default_hand_landmarks_style(),
                         mp_drawing_styles.get_default_hand_connections_style()
                     )
-                    
-                    landmarks = []
-                    for landmark in hand_landmarks.landmark:
-                        landmarks.extend([landmark.x, landmark.y, landmark.z])
-                    landmarks = normalize_landmarks(landmarks)
-                    
-                    prediction = model.predict(np.array([landmarks]), verbose=0)
-                    pred_digit = np.argmax(prediction[0])
-                    confidence = np.max(prediction[0])
-                    prediction_buffer.append(pred_digit)
-                    
-                    # Use the mode of the buffer for a smoothed prediction
-                    smoothed_pred = max(set(prediction_buffer), key=prediction_buffer.count)
-                    
-                    cv2.putText(
-                        frame,
-                        f"Digit: {smoothed_pred} ({confidence:.2f})",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0,
-                        (0, 255, 0),
-                        2
-                    )
-            
-            cv2.imshow('Hand Gesture Recognition', frame)
+
+            cv2.imshow("Real-Time Hand Gesture Recognition", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     cap.release()
@@ -643,7 +725,7 @@ if __name__ == "__main__":
         choice = input("Dataset found. Do you want to [t]rain on existing data, [c]ollect new data, or [r]un recognition? (t/c/r): ").lower()
         
         if choice == 'c':
-            X, y = collect_hand_landmarks_dataset(num_samples_per_digit=10)
+            X, y = collect_hand_gesture_images(num_samples_per_class=10)
         elif choice == 't':
             X, y = load_dataset(dataset_path)
             if X is not None and y is not None:
@@ -653,27 +735,63 @@ if __name__ == "__main__":
         else:
             print("Invalid choice. Exiting.")
 
+    # -------------------------------
+    # Updated Evaluation Code:
+    # -------------------------------
+    
     # Load dataset previously collected (adjust the file path as needed)
     with open(dataset_path, 'rb') as f:
         data = pickle.load(f)
 
-    X = np.array(data['features'])  # Each sample should be a vector of length 63.
-    y = np.array(data['labels'])      # Labels as integers (0-9)
+    # X_raw contains raw landmark features as collected (length 63 per sample)
+    X_raw = np.array(data['features'])
+    # IMPORTANT: Normalize each sample using the same function as used during training
+    X = np.array([normalize_landmarks(sample) for sample in X_raw])
+    y = np.array(data['labels'])      # Labels remain as integers (0-9)
 
-    # Split data into training and testing sets. You might use a 80-20 split.
+    # Split data into training and testing sets (80-20 split)
+    from sklearn.model_selection import train_test_split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # If your model was trained with categorical_crossentropy, convert the labels to one-hot vectors
+    # Convert labels to one-hot vectors for evaluation if using categorical_crossentropy
+    from tensorflow.keras.utils import to_categorical
     y_test_cat = to_categorical(y_test, num_classes=10)
 
     # Evaluate the model using the evaluate function (returns loss and accuracy)
     loss, accuracy = model.evaluate(X_test, y_test_cat, verbose=0)
     print("Model Evaluate Test Accuracy:", accuracy)
 
-    # Alternatively, you can calculate accuracy manually:
-    # 1. Get predictions and convert them to class labels.
+    # Alternatively, calculate accuracy manually:
     predictions = model.predict(X_test, verbose=0)
     predicted_classes = np.argmax(predictions, axis=1)
-    # 2. Calculate accuracy using sklearn metrics.
+
+    from sklearn.metrics import accuracy_score
     acc = accuracy_score(y_test, predicted_classes)
-    print("Sklearn Accuracy Score:", acc) 
+    print("Sklearn Accuracy Score:", acc)
+
+    # Example training code:
+    X, y = collect_hand_gesture_images(num_samples_per_class=50)  # Adjust sample count as needed
+    X = X.astype('float32')  # Already normalized by preprocess_image (divided by 255)
+    
+    # Split the dataset
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # One-hot encode labels
+    y_train_cat = to_categorical(y_train, num_classes=10)
+    y_test_cat = to_categorical(y_test, num_classes=10)
+    
+    # Create CNN model
+    model = create_cnn_hand_gesture_model(input_shape=(64,64,1), num_classes=10)
+    
+    # Train the CNN
+    history = model.fit(
+        X_train, y_train_cat,
+        epochs=50,  # adjust epochs as needed
+        batch_size=32,
+        validation_split=0.2,
+        verbose=1
+    )
+    
+    # Evaluate the model
+    test_loss, test_acc = model.evaluate(X_test, y_test_cat, verbose=0)
+    print("CNN Test Accuracy:", test_acc) 
